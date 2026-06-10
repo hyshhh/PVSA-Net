@@ -1,0 +1,24 @@
+PATHS:
+  # Results output folder
+  RESULTS: './mmseg_log/lformer/MODS'
+  # Path to where the dataset is stored
+  DATASET: './data/MODS'
+  # Path to where calibration files are stored
+  DATASET_CALIB: './data/MODS/calibration'
+  # Path to where the segmentation predictions are stored
+  SEGMENTATIONS: './mmseg_log/lformer/MODS/predictions_3'
+
+SEGMENTATIONS:
+  # Prediciton dir structure:
+  #  - False: pred_dir/method/sequence/frame.png
+  #  - True:  pred_dir/sequence/method/frame.png
+  SEQ_FIRST: False
+  # Specify which colors are used in segmentation maps
+  INPUT_COLORS: 
+    - [247, 195,  37]    #[247, 195,  37] # Obstacle
+    - [ 41, 167, 224]  #[ 41, 167, 224] # Water
+    - [ 90,  75, 164]  #[ 90,  75, 164] # Sky
+
+VISUALIZATION:
+  # Display per-sequence evaluation progress
+  SEQUENCE_PROGRESS: True
