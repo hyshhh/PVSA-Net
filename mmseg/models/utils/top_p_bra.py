@@ -1,19 +1,16 @@
 from typing import Tuple
+import warnings
 
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import numpy as np
-import cv2
 
-
-import cv2
-import numpy as np
+from .topp_flash_kernel import is_topp_flash_available, topp_flash_attention
 
 def overlay_topk_attn_block_no_heatmap(img, topk_score, topk_index, total_patches, dark_ratio=0.3):
     """
@@ -310,7 +307,7 @@ class ToppAttention(nn.Module):
                  kv_per_win=4, kv_downsample_ratio=4, kv_downsample_kernel=None, kv_downsample_mode='identity',
                  topk=4, param_attention="qkvo", param_routing=False, diff_routing=False, soft_routing=True,
                  side_dwconv=3,
-                 auto_pad=False,W=False):
+                 auto_pad=False,W=False, use_topp_flash=False):
         super().__init__()
         # local attention setting
         self.dim = dim
@@ -320,6 +317,8 @@ class ToppAttention(nn.Module):
         assert self.qk_dim % num_heads == 0 and self.dim % num_heads == 0, 'qk_dim and dim must be divisible by num_heads!'
         self.scale = qk_scale or self.qk_dim ** -0.5
         self.W=W
+        self.use_topp_flash = use_topp_flash
+        self._topp_flash_warned = False
 
         ################side_dwconv (i.e. LCE in ShuntedTransformer)###########
         self.lepe = nn.Conv2d(dim, dim, kernel_size=side_dwconv, stride=1, padding=side_dwconv // 2,
@@ -449,6 +448,32 @@ class ToppAttention(nn.Module):
 
         # 路由机制
         r_weight, r_idx, r_mask = self.router(q_win, k_win,GA)  # all are (n, p^2, topk) tensors
+
+        if self.use_topp_flash and is_topp_flash_available():
+            out = topp_flash_attention(
+                q_pix=q_pix,
+                kv_pix=kv_pix,
+                r_weight=r_weight,
+                r_idx=r_idx,
+                r_mask=r_mask,
+                num_heads=self.num_heads,
+                qk_dim=self.qk_dim,
+                dim=self.dim,
+                scale=self.scale,
+                n_win=self.n_win,
+                H=H,
+                W=W)
+            out = out + lepe
+            out = self.wo(out)
+            if self.auto_pad and (pad_r > 0 or pad_b > 0):
+                out = out[:, :H_in, :W_in, :].contiguous()
+            return out
+
+        if self.use_topp_flash and not self._topp_flash_warned:
+            warnings.warn(
+                'topp flash attention kernel is unavailable; '
+                'fallback to the torch implementation.')
+            self._topp_flash_warned = True
 
         kv_pix_sel = self.kv_gather(r_idx=r_idx, r_weight=r_weight, kv=kv_pix)  # (n, p^2, topk, h_kv*w_kv, c_qk+c_v)
         k_pix_sel, v_pix_sel = kv_pix_sel.split([self.qk_dim, self.dim], dim=-1)
