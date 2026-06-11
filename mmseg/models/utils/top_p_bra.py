@@ -307,7 +307,7 @@ class ToppAttention(nn.Module):
                  kv_per_win=4, kv_downsample_ratio=4, kv_downsample_kernel=None, kv_downsample_mode='identity',
                  topk=4, param_attention="qkvo", param_routing=False, diff_routing=False, soft_routing=True,
                  side_dwconv=3,
-                 auto_pad=False,W=False, use_topp_flash=False):
+                 auto_pad=False,W=False, use_topp_flash=False, topp_flash_block_windows=64):
         super().__init__()
         # local attention setting
         self.dim = dim
@@ -318,6 +318,7 @@ class ToppAttention(nn.Module):
         self.scale = qk_scale or self.qk_dim ** -0.5
         self.W=W
         self.use_topp_flash = use_topp_flash
+        self.topp_flash_block_windows = topp_flash_block_windows
         self._topp_flash_warned = False
 
         ################side_dwconv (i.e. LCE in ShuntedTransformer)###########
@@ -449,7 +450,7 @@ class ToppAttention(nn.Module):
         # 路由机制
         r_weight, r_idx, r_mask = self.router(q_win, k_win,GA)  # all are (n, p^2, topk) tensors
 
-        if self.use_topp_flash and is_topp_flash_available():
+        if self.use_topp_flash and not ret_attn_mask and is_topp_flash_available():
             out = topp_flash_attention(
                 q_pix=q_pix,
                 kv_pix=kv_pix,
@@ -462,7 +463,8 @@ class ToppAttention(nn.Module):
                 scale=self.scale,
                 n_win=self.n_win,
                 H=H,
-                W=W)
+                W=W,
+                block_windows=self.topp_flash_block_windows)
             out = out + lepe
             out = self.wo(out)
             if self.auto_pad and (pad_r > 0 or pad_b > 0):
