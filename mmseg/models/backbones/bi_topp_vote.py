@@ -43,7 +43,8 @@ class Block(nn.Module):
                  kv_per_win=4, kv_downsample_ratio=4, kv_downsample_kernel=None, kv_downsample_mode='ada_avgpool',
                  topk=4, param_attention="qkvo", param_routing=False, diff_routing=False, soft_routing=False,
                  mlp_ratio=4, mlp_dwconv=False,
-                 side_dwconv=5, before_attn_dwconv=3, pre_norm=True, auto_pad=False,W=False):
+                 side_dwconv=5, before_attn_dwconv=3, pre_norm=True, auto_pad=False,W=False,
+                 use_topp_flash=False, topp_flash_block_windows=64):
         super().__init__()
         qk_dim = qk_dim or dim
 
@@ -73,7 +74,9 @@ class Block(nn.Module):
                                                 topk=topk, param_attention=param_attention, param_routing=param_routing,
                                                 diff_routing=diff_routing, soft_routing=soft_routing,
                                                 side_dwconv=side_dwconv,
-                                                auto_pad=auto_pad,W=self.W)
+                                                auto_pad=auto_pad,W=self.W,
+                                                use_topp_flash=use_topp_flash,
+                                                topp_flash_block_windows=topp_flash_block_windows)
         elif topk == -1:
             self.attn = Attention(dim=dim)
         elif topk == -2:
@@ -354,10 +357,14 @@ class VTFormer(nn.Module):
                  param_attention='qkvo',
                  mlp_dwconv=False,
                  norm_eval=False,
-                 W=False):
+                 W=False,
+                 use_topp_flash=False,
+                 topp_flash_block_windows=64):
 
         super().__init__()
         self.W=W
+        self.use_topp_flash = use_topp_flash
+        self.topp_flash_block_windows = topp_flash_block_windows
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.norm_eval = norm_eval
@@ -479,7 +486,9 @@ class VTFormer(nn.Module):
                         before_attn_dwconv=before_attn_dwconv,  # 在注意力前加入的卷积核大小，用于特征增强
                         pre_norm=pre_norm,
                         auto_pad=auto_pad,
-                        W=self.W) for j in range(depth[i])],  # 是否自动为卷积层补零，使得输出尺寸与输入一致
+                        W=self.W,
+                        use_topp_flash=self.use_topp_flash,
+                        topp_flash_block_windows=self.topp_flash_block_windows) for j in range(depth[i])],  # 是否自动为卷积层补零，使得输出尺寸与输入一致
             )
             if i in use_checkpoint_stages:
                 stage = checkpoint_wrapper(stage)
