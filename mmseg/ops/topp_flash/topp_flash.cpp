@@ -4,7 +4,7 @@ torch::Tensor topp_flash_forward_cuda(torch::Tensor q_pix,
                                       torch::Tensor kv_pix,
                                       torch::Tensor r_weight,
                                       torch::Tensor r_idx,
-                                      torch::Tensor r_mask,
+                                      torch::Tensor keep_len,
                                       int64_t num_heads,
                                       int64_t qk_dim,
                                       int64_t dim,
@@ -17,7 +17,7 @@ torch::Tensor topp_flash_forward(torch::Tensor q_pix,
                                  torch::Tensor kv_pix,
                                  torch::Tensor r_weight,
                                  torch::Tensor r_idx,
-                                 torch::Tensor r_mask,
+                                 torch::Tensor keep_len,
                                  int64_t num_heads,
                                  int64_t qk_dim,
                                  int64_t dim,
@@ -29,7 +29,7 @@ torch::Tensor topp_flash_forward(torch::Tensor q_pix,
   TORCH_CHECK(kv_pix.is_cuda(), "kv_pix must be a CUDA tensor");
   TORCH_CHECK(r_weight.is_cuda(), "r_weight must be a CUDA tensor");
   TORCH_CHECK(r_idx.is_cuda(), "r_idx must be a CUDA tensor");
-  TORCH_CHECK(r_mask.is_cuda(), "r_mask must be a CUDA tensor");
+  TORCH_CHECK(keep_len.is_cuda(), "keep_len must be a CUDA tensor");
   TORCH_CHECK(q_pix.scalar_type() == torch::kFloat32,
               "pvsa v3.0 CUDA forward currently supports float32 only");
   TORCH_CHECK(kv_pix.scalar_type() == torch::kFloat32,
@@ -38,14 +38,19 @@ torch::Tensor topp_flash_forward(torch::Tensor q_pix,
               "pvsa v3.0 CUDA forward currently supports float32 only");
   TORCH_CHECK(r_idx.scalar_type() == torch::kLong,
               "r_idx must be int64");
-  TORCH_CHECK(r_mask.scalar_type() == torch::kBool,
-              "r_mask must be bool");
+  TORCH_CHECK(keep_len.scalar_type() == torch::kLong,
+              "keep_len must be int64");
+  TORCH_CHECK(keep_len.dim() == 2,
+              "keep_len must be a 2D tensor");
+  TORCH_CHECK(keep_len.size(0) == q_pix.size(0) &&
+                  keep_len.size(1) == q_pix.size(1),
+              "keep_len shape must match q_pix n and p2");
 
   return topp_flash_forward_cuda(q_pix.contiguous(),
                                  kv_pix.contiguous(),
                                  r_weight.contiguous(),
                                  r_idx.contiguous(),
-                                 r_mask.contiguous(),
+                                 keep_len.contiguous(),
                                  num_heads,
                                  qk_dim,
                                  dim,

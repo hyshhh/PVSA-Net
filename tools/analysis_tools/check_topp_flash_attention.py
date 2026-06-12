@@ -75,8 +75,13 @@ def make_inputs(args, device, dtype):
     r_weight = torch.rand(
         args.batch, p2, args.topk, device=device, dtype=dtype)
     r_idx = torch.randint(0, p2, (args.batch, p2, args.topk), device=device)
-    r_mask = torch.rand(args.batch, p2, args.topk, device=device) > 0.25
-    r_mask[..., 0] = True
+    keep_len = torch.arange(args.batch * p2, device=device).reshape(
+        args.batch, p2)
+    keep_len = keep_len.remainder(args.topk).add_(1)
+    pos = torch.arange(args.topk, device=device).view(1, 1, args.topk)
+    r_mask = pos < keep_len[..., None]
+    r_weight = r_weight * r_mask.to(dtype)
+    r_idx = r_idx.masked_fill(~r_mask, 0)
     return {
         'q_pix': q_pix,
         'kv_pix': kv_pix,

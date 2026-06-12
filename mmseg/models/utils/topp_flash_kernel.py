@@ -103,11 +103,11 @@ def topp_flash_attention(q_pix: Tensor,
                          backend: Optional[str] = None) -> Tensor:
     """Compute routed attention without materializing the full kv_gather tensor."""
     backend = _normalize_backend(backend)
-    if backend in _TORCH_BACKENDS:
+    if backend in _TORCH_BACKENDS:   #1. 调用torch后端能处理分块
         return _ToppBlockAttentionFunction.apply(
             q_pix, kv_pix, r_weight, r_idx, r_mask, num_heads, qk_dim, dim,
             float(scale), n_win, H, W, int(block_windows))
-    if backend in _CUDA_BACKENDS:
+    if backend in _CUDA_BACKENDS:   #如果设置的是用cuda后端，先检查cuda内核是否能运行，尝试调用自定义的cuda内核
         if _can_run_cuda_forward(q_pix, kv_pix, r_weight, r_idx, r_mask):
             try:
                 return _ToppCudaForwardFunction.apply(
@@ -145,18 +145,19 @@ class _ToppCudaForwardFunction(torch.autograd.Function):
         r_weight = r_weight.contiguous()
         r_idx = r_idx.contiguous().long()
         r_mask = r_mask.contiguous().bool()
+        keep_len = r_mask.sum(dim=-1).contiguous().long()
         ctx.save_for_backward(q_pix, kv_pix, r_weight, r_idx, r_mask)
         ctx.params = (num_heads, qk_dim, dim, scale, n_win, H, W,
-                      block_windows)
+                      block_windows, keep_len)
         extension = _load_cuda_extension()
-        return extension.forward(q_pix, kv_pix, r_weight, r_idx, r_mask,
+        return extension.forward(q_pix, kv_pix, r_weight, r_idx, keep_len,
                                  num_heads, qk_dim, dim, float(scale),
                                  n_win, H, W)
 
     @staticmethod
     def backward(ctx, grad_out: Tensor) -> Tuple[Optional[Tensor], ...]:
         q_pix, kv_pix, r_weight, r_idx, r_mask = ctx.saved_tensors
-        num_heads, qk_dim, dim, scale, n_win, H, W, block_windows = ctx.params
+        num_heads, qk_dim, dim, scale, n_win, H, W, block_windows, keep_len = ctx.params
 
         needs = ctx.needs_input_grad
         with torch.enable_grad():
@@ -165,7 +166,7 @@ class _ToppCudaForwardFunction(torch.autograd.Function):
             rw = r_weight.detach().requires_grad_(needs[2])
             out = _topp_attention_block_impl(
                 q, kv, rw, r_idx, r_mask, num_heads, qk_dim, dim, scale,
-                n_win, H, W, block_windows)
+                n_win, H, W, block_windows, keep_len)
 
         targets = []
         positions = []
@@ -203,18 +204,19 @@ class _ToppBlockAttentionFunction(torch.autograd.Function):
         r_weight = r_weight.contiguous()
         r_idx = r_idx.contiguous()
         r_mask = r_mask.contiguous().bool()
+        keep_len = r_mask.sum(dim=-1).contiguous().long()
         ctx.save_for_backward(q_pix, kv_pix, r_weight, r_idx, r_mask)
         ctx.params = (num_heads, qk_dim, dim, scale, n_win, H, W,
-                      block_windows)
+                      block_windows, keep_len)
         with torch.no_grad():
             return _topp_attention_block_impl(
                 q_pix, kv_pix, r_weight, r_idx, r_mask, num_heads, qk_dim,
-                dim, scale, n_win, H, W, block_windows)
+                dim, scale, n_win, H, W, block_windows, keep_len)
 
     @staticmethod
     def backward(ctx, grad_out: Tensor) -> Tuple[Optional[Tensor], ...]:
         q_pix, kv_pix, r_weight, r_idx, r_mask = ctx.saved_tensors
-        num_heads, qk_dim, dim, scale, n_win, H, W, block_windows = ctx.params
+        num_heads, qk_dim, dim, scale, n_win, H, W, block_windows, keep_len = ctx.params
 
         needs = ctx.needs_input_grad
         with torch.enable_grad():
@@ -223,7 +225,7 @@ class _ToppBlockAttentionFunction(torch.autograd.Function):
             rw = r_weight.detach().requires_grad_(needs[2])
             out = _topp_attention_block_impl(
                 q, kv, rw, r_idx, r_mask, num_heads, qk_dim, dim, scale,
-                n_win, H, W, block_windows)
+                n_win, H, W, block_windows, keep_len)
 
         targets = []
         positions = []
@@ -260,7 +262,8 @@ def _topp_attention_block_impl(q_pix: Tensor,
                                n_win: int,
                                H: int,
                                W: int,
-                               block_windows: int = 64) -> Tensor:
+                               block_windows: int = 64,
+                               keep_len: Optional[Tensor] = None) -> Tensor:
     _validate_inputs(q_pix, kv_pix, r_weight, r_idx, r_mask, num_heads,
                      qk_dim, dim, n_win, H, W)
     n, p2, q_len, _ = q_pix.shape
@@ -272,10 +275,13 @@ def _topp_attention_block_impl(q_pix: Tensor,
     block_windows = flat_size if block_windows <= 0 else min(block_windows,
                                                              flat_size)
 
+    if keep_len is None:
+        keep_len = r_mask.sum(dim=-1).long()
+    keep_flat = keep_len.reshape(flat_size)
+
     q_flat = q_pix.reshape(flat_size, q_len, qk_dim)
     idx_flat = r_idx.reshape(flat_size, topk).long()
     weight_flat = r_weight.reshape(flat_size, topk).to(kv_pix.dtype)
-    mask_flat = r_mask.reshape(flat_size, topk).bool()
     flat_out = []
 
     for start in range(0, flat_size, block_windows):
@@ -285,28 +291,36 @@ def _topp_attention_block_impl(q_pix: Tensor,
         n_ids = torch.div(flat_ids, p2, rounding_mode='floor')
 
         kv_batch = kv_pix.index_select(0, n_ids)
-        idx = idx_flat[start:end]
+        keep = keep_flat[start:end]
+        max_keep = int(keep.max().item())
+        if max_keep <= 0:
+            flat_out.append(torch.zeros(batch, q_len, dim, device=q_pix.device, dtype=kv_pix.dtype))
+            continue
+        max_keep = min(max_keep, topk)
+
+        idx = idx_flat[start:end, :max_keep]
+        weight = weight_flat[start:end, :max_keep]
         kv_sel = torch.gather(
             kv_batch,
             dim=1,
-            index=idx.view(batch, topk, 1, 1).expand(
+            index=idx.view(batch, max_keep, 1, 1).expand(
                 -1, -1, kv_len, c_kv))
-        kv_sel = weight_flat[start:end].view(
-            batch, topk, 1, 1) * kv_sel
+        kv_sel = weight.view(batch, max_keep, 1, 1) * kv_sel
         k_sel, v_sel = kv_sel.split([qk_dim, dim], dim=-1)
 
-        k_sel = k_sel.view(batch, topk, kv_len, num_heads,
+        k_sel = k_sel.view(batch, max_keep, kv_len, num_heads,
                            head_q).permute(0, 3, 4, 1, 2).reshape(
-                               batch, num_heads, head_q, topk * kv_len)
-        v_sel = v_sel.view(batch, topk, kv_len, num_heads,
+                               batch, num_heads, head_q, max_keep * kv_len)
+        v_sel = v_sel.view(batch, max_keep, kv_len, num_heads,
                            head_v).permute(0, 3, 1, 2, 4).reshape(
-                               batch, num_heads, topk * kv_len, head_v)
+                               batch, num_heads, max_keep * kv_len, head_v)
         q = q_flat[start:end].view(batch, q_len, num_heads,
                                    head_q).permute(0, 2, 1, 3)
 
         scores = (q * scale) @ k_sel
-        route_mask = mask_flat[start:end, :, None].expand(
-            -1, -1, kv_len).reshape(batch, 1, 1, topk * kv_len)
+        pos = torch.arange(max_keep, device=q_pix.device)
+        valid_mask = pos[None, :] < keep[:, None]
+        route_mask = valid_mask[:, :, None].expand(-1, -1, kv_len).reshape(batch, 1, 1, max_keep * kv_len)
         scores = scores.masked_fill(~route_mask, torch.finfo(scores.dtype).min)
         attn = torch.softmax(scores, dim=-1)
         out = attn @ v_sel
@@ -352,23 +366,24 @@ def _cuda_source_paths() -> Tuple[Path, Path]:
 
 
 def _load_cuda_extension():
-    global _CUDA_EXTENSION, _CUDA_EXTENSION_ERROR
-    if _CUDA_EXTENSION is not None:
+    global _CUDA_EXTENSION, _CUDA_EXTENSION_ERROR   #用于缓存已加载的拓展
+    if _CUDA_EXTENSION is not None:  #如果已经加载过，直接返回缓存实例
         return _CUDA_EXTENSION
     if not _can_build_cuda_extension():
         raise RuntimeError('PVSA CUDA extension build environment is missing.')
 
-    cpp_path, cu_path = _cuda_source_paths()
-    extra_cuda_cflags = ['-O3']
-    arch_list = os.getenv('PVSA_TOPP_FLASH_ARCH')
+    cpp_path, cu_path = _cuda_source_paths()  #获取cuda源码文件路径.cpp 绑定文件 + .cu 内核文件
+    extra_cuda_cflags = ['-O3']    #编译优化级别为最高
+    arch_list = os.getenv('PVSA_TOPP_FLASH_ARCH')   #通过环境指定目标GPU架构
     if arch_list:
         os.environ['TORCH_CUDA_ARCH_LIST'] = arch_list
     try:
-        _CUDA_EXTENSION = load(
-            name='pvsa_topp_flash_cuda',
-            sources=[str(cpp_path), str(cu_path)],
-            extra_cuda_cflags=extra_cuda_cflags,
-            verbose=os.getenv('PVSA_TOPP_FLASH_VERBOSE', '0') == '1')
+        _CUDA_EXTENSION = load(  #核心调用：torch.utils.cpp_extension.load() 是 PyTorch 的 JIT 编译器。把 C++/CUDA 源码编译成 Python 可调用的模块。
+            name='pvsa_topp_flash_cuda',   # 编译产物的名字Linux——共享库（多个程序可以共享的代码库）——pvsa_topp_flash_cuda.so
+            sources=[str(cpp_path), str(cu_path)], # 要编译的源文件
+            extra_cuda_cflags=extra_cuda_cflags,  # nvcc 编译参数
+            verbose=os.getenv('PVSA_TOPP_FLASH_VERBOSE', '0') == '1') # 是否打印编译日志
+    # 最终存到全局变量中，全局变量不会随之函数的结束而销毁//程序结束文件还在
     except Exception as exc:
         _CUDA_EXTENSION_ERROR = exc
         raise
